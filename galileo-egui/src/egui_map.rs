@@ -451,9 +451,27 @@ impl<'a> EguiMapState {
                 pos,
                 force: _,
             } => {
+                // Apply the same window-root → widget-local offset the
+                // `PointerMoved` branch does. egui hands us touch `pos`
+                // in window-root logical points (identical to
+                // `PointerMoved`'s `position`), but galileo's event
+                // processor keeps pointer state in widget-local coords
+                // and its touch-vs-synthetic-mouse dedup compares the
+                // two by taxicab distance. Without the offset, the
+                // stored touch position and the subsequent mouse
+                // position differ by exactly the widget's top-left
+                // offset — so when a host wraps the map in a layout
+                // with insets (e.g. Android status-bar padding), the
+                // dedup distance check exceeds its threshold and both
+                // the real tap Click *and* the platform's synthetic
+                // follow-up mouse Click reach the handler, producing
+                // two clicks per tap at a fixed offset from each other.
                 let event = TouchEvent {
                     touch_id: id.0,
-                    position: Point2::new(pos.x as f64, pos.y as f64),
+                    position: Point2::new(
+                        (pos.x + offset[0]) as f64,
+                        (pos.y + offset[1]) as f64,
+                    ),
                 };
                 match phase {
                     egui::TouchPhase::Start => Some(RawUserEvent::TouchStart(event)),

@@ -248,11 +248,19 @@ impl Pipelines {
                     origin: Origin2d::ZERO,
                     flip_y: false,
                 };
+                // Tags must match wgpu's unrestricted byte-copy path for
+                // ImageBitmap sources (wgpu-core/src/device/queue.rs ~L974):
+                //   - destination.color_space == Srgb
+                //   - destination.premultiplied_alpha == false
+                //   - source.origin == (0,0), source.flip_y == false
+                // Any other combination demands the
+                // UNRESTRICTED_EXTERNAL_TEXTURE_COPIES downlevel flag, which
+                // most browser/GPU pairs don't advertise.
                 queue.copy_external_image_to_texture(
                     &image,
                     texture
                         .as_image_copy()
-                        .to_tagged(wgpu::PredefinedColorSpace::DisplayP3, false),
+                        .to_tagged(wgpu::PredefinedColorSpace::Srgb, false),
                     texture_size,
                 );
 

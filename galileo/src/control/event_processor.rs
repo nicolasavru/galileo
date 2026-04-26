@@ -10,11 +10,18 @@ use crate::map::Map;
 const DRAG_THRESHOLD: f64 = 3.0;
 const CLICK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 const DBL_CLICK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+// Touch-capable browsers (and some native platforms) deliver a touch
+// sequence AND a synthesized mouse sequence for a single tap. After we
+// emit a touch-derived Click we suppress any mouse-button Click that
+// arrives within this window at approximately the same position, so
+// downstream handlers see exactly one Click per tap.
+const TOUCH_MOUSE_SUPPRESS_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+const TOUCH_MOUSE_SUPPRESS_DISTANCE: f64 = 25.0;
 
 struct TouchInfo {
     id: TouchId,
     start_position: Point2,
-    _start_time: SystemTime,
+    start_time: SystemTime,
     prev_position: Point2,
 }
 
@@ -32,6 +39,10 @@ pub struct EventProcessor {
 
     last_pressed_time: SystemTime,
     last_click_time: SystemTime,
+    // Records the time and position of the most recent touch-derived
+    // Click so we can suppress the synthetic mouse Click the platform
+    // fires right after.
+    last_touch_click: Option<(SystemTime, Point2)>,
 
     drag_target: Option<usize>,
 }
@@ -46,6 +57,7 @@ impl Default for EventProcessor {
             buttons_state: Default::default(),
             last_pressed_time: SystemTime::UNIX_EPOCH,
             last_click_time: SystemTime::UNIX_EPOCH,
+            last_touch_click: None,
             drag_target: None,
         }
     }
@@ -129,15 +141,31 @@ impl EventProcessor {
 
                 if (now.duration_since(self.last_pressed_time)).unwrap_or_default() < CLICK_TIMEOUT
                 {
-                    events.push(UserEvent::Click(button, self.get_mouse_event()));
+                    // Browsers synthesize a Left mouse sequence right
+                    // after a tap. If we just emitted a touch-derived
+                    // Click at ~the same spot, drop this one — otherwise
+                    // downstream handlers see two clicks per tap.
+                    let is_synthetic_from_touch = button == MouseButton::Left
+                        && self.last_touch_click.is_some_and(|(t, p)| {
+                            now.duration_since(t).unwrap_or_default()
+                                < TOUCH_MOUSE_SUPPRESS_WINDOW
+                                && self
+                                    .pointer_position
+                                    .taxicab_distance(&p)
+                                    < TOUCH_MOUSE_SUPPRESS_DISTANCE
+                        });
 
-                    if (now.duration_since(self.last_click_time)).unwrap_or_default()
-                        < DBL_CLICK_TIMEOUT
-                    {
-                        events.push(UserEvent::DoubleClick(button, self.get_mouse_event()));
+                    if !is_synthetic_from_touch {
+                        events.push(UserEvent::Click(button, self.get_mouse_event()));
+
+                        if (now.duration_since(self.last_click_time)).unwrap_or_default()
+                            < DBL_CLICK_TIMEOUT
+                        {
+                            events.push(UserEvent::DoubleClick(button, self.get_mouse_event()));
+                        }
+
+                        self.last_click_time = now;
                     }
-
-                    self.last_click_time = now;
                 }
 
                 if self.drag_target.is_some() {
@@ -191,7 +219,7 @@ impl EventProcessor {
                 self.touches.push(TouchInfo {
                     id: touch.touch_id,
                     start_position: touch.position,
-                    _start_time: now,
+                    start_time: now,
                     prev_position: touch.position,
                 });
 
@@ -247,9 +275,10 @@ impl EventProcessor {
                 Some(events)
             }
             RawUserEvent::TouchEnd(touch) => {
+                let mut ended_touch = None;
                 for i in 0..self.touches.len() {
                     if self.touches[i].id == touch.touch_id {
-                        self.touches.remove(i);
+                        ended_touch = Some(self.touches.remove(i));
                         break;
                     }
                 }
@@ -262,6 +291,39 @@ impl EventProcessor {
                         MouseButton::Other,
                         self.get_mouse_event_pos(touch.position),
                     ));
+                } else if let Some(ended_touch) = ended_touch {
+                    // Require no concurrent touches so a pinch release doesn't fire Click.
+                    let moved = touch
+                        .position
+                        .taxicab_distance(&ended_touch.start_position)
+                        > DRAG_THRESHOLD;
+                    let duration = now
+                        .duration_since(ended_touch.start_time)
+                        .unwrap_or_default();
+                    if !moved
+                        && duration < CLICK_TIMEOUT
+                        && self.touches.is_empty()
+                        && self.drag_target.is_none()
+                    {
+                        events.push(UserEvent::Click(
+                            MouseButton::Other,
+                            self.get_mouse_event_pos(touch.position),
+                        ));
+
+                        if now
+                            .duration_since(self.last_click_time)
+                            .unwrap_or_default()
+                            < DBL_CLICK_TIMEOUT
+                        {
+                            events.push(UserEvent::DoubleClick(
+                                MouseButton::Other,
+                                self.get_mouse_event_pos(touch.position),
+                            ));
+                        }
+
+                        self.last_click_time = now;
+                        self.last_touch_click = Some((now, touch.position));
+                    }
                 }
 
                 Some(events)
